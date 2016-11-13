@@ -36,15 +36,16 @@ state searches.
 
 from __future__ import print_function
 
+import glob
 import logging
 import os
+import stat
 import time
 
 import pybel
 from rmgpy import settings
 from rmgpy.data.thermo import ThermoDatabase
 
-import constants
 import gen3D
 import util
 from quantum import QuantumError
@@ -68,7 +69,6 @@ class ARD(object):
     `nbreak`        ``int``                  The maximum number of bonds that may be broken
     `nform`         ``int``                  The maximum number of bonds that may be formed
     `dh_cutoff`     ``float``                Heat of reaction cutoff (kcal/mol) for reactions that are too endothermic
-    `theory_low`    ``str``                  Low level of theory for pre-optimizations
     `forcefield`    ``str``                  The force field for 3D geometry generation
     `distance`      ``float``                The initial distance between molecules
     `Qclass`        ``class``                A class representing the quantum software
@@ -78,13 +78,12 @@ class ARD(object):
 
     """
 
-    def __init__(self, reac_smi, nbreak=3, nform=3, dh_cutoff=20.0, theory_low=None,
+    def __init__(self, reac_smi, nbreak=3, nform=3, dh_cutoff=20.0,
                  forcefield='mmff94', distance=3.5, output_dir='', **kwargs):
         self.reac_smi = reac_smi
         self.nbreak = int(nbreak)
         self.nform = int(nform)
         self.dh_cutoff = float(dh_cutoff)
-        self.theory_low = theory_low
         self.forcefield = forcefield
         self.distance = float(distance)
         qprog = kwargs.get('qprog', 'gau')
@@ -114,28 +113,24 @@ class ARD(object):
         reac_mol = gen3D.readstring('smi', self.reac_smi)
         reac_mol.addh()
         reac_mol.gen3D(forcefield=self.forcefield, d=self.distance)
-        self.reactant = reac_mol.toNode()
+# ypli       self.reactant = reac_mol.toNode()
         return reac_mol
 
     def preopt(self, mol, **kwargs):
         """
-        Optimize `mol` at the low level of theory and return its energy in
-        kcal/mol. The optimization is done separately for each molecule in the
-        structure. If the optimization was unsuccessful or if no low level of
-        theory was specified, `None` is returned.
+        Optimize `mol` at the PM6 level of theory and return the PM6 energy.
+        The optimization is done separately for each molecule in the structure.
+        If the optimization was unsuccessful, `None` is returned.
         """
-        if self.theory_low is None:
-            return None
-
         kwargs_copy = kwargs.copy()
-        kwargs_copy['theory'] = self.theory_low
+        kwargs_copy['theory'] = 'pm6'
 
         try:
             mol.optimizeGeometry(self.Qclass, name='preopt', **kwargs_copy)
         except QuantumError:
             return None
 
-        return mol.energy * constants.hartree_to_kcal_per_mol
+        return mol.energy
 
     @util.logStartAndFinish
     @util.timeFn
@@ -162,8 +157,9 @@ class ARD(object):
         """
         start_time = time.time()
         reac_mol = self.initialize()
-        preopt_energy_reac = self.preopt(reac_mol, **kwargs)
-        self.optimizeReactant(reac_mol, **kwargs)
+        PM6_energy_reac = None
+#ypli        PM6_energy_reac = self.preopt(reac_mol, **kwargs)
+#ypli        self.optimizeReactant(reac_mol, **kwargs)
 
         gen = Generate(reac_mol)
         gen.generateProducts(nbreak=self.nbreak, nform=self.nform)
@@ -172,20 +168,26 @@ class ARD(object):
         # Load thermo database and choose which libraries to search
         thermo_db = ThermoDatabase()
         thermo_db.load(os.path.join(settings['database.directory'], 'thermo'))
-        thermo_db.libraryOrder = ['primaryThermoLibrary', 'NISTThermoLibrary', 'thermo_DFT_CCSDTF12_BAC',
-                                  'CBS_QB3_1dHR', 'DFT_QCI_thermo', 'KlippensteinH2O2', 'GRI-Mech3.0-N', ]
+        thermo_db.libraryOrder = ['primaryThermoLibrary', 'NISTThermoLibrary', 'DFT_QCI_thermo', 'CBS_QB3_1dHR',
+                                  'KlippensteinH2O2', 'GRI-Mech3.0-N', 'thermo_DFT_CCSDTF12_BAC']
 
         # Filter reactions based on standard heat of reaction
         H298_reac = reac_mol.getH298(thermo_db)
         prod_mols_filtered = [mol for mol in prod_mols
-                              if self.filterThreshold(H298_reac, preopt_energy_reac, mol,
-                                                      thermo_db=thermo_db, **kwargs)]
+                              if self.filterThreshold(H298_reac, PM6_energy_reac, mol, thermo_db=thermo_db, **kwargs)]
 
         # Generate 3D geometries (make3D is False because coordinates already exist from the reactant)
         # and make job files
         if prod_mols_filtered:
             self.logger.info('Feasible products:\n')
             rxn_dir = util.makeOutputSubdirectory(self.output_dir, 'reactions')
+
+            try:
+                example_script = glob.glob('submit.*')[0]
+            except IndexError:
+                raise Exception('Example submission script cannot be found')
+            else:
+                example_script_path = os.path.abspath(example_script)
 
             # These two lines are required so that new coordinates are
             # generated for each new product. Otherwise, Open Babel tries to
@@ -197,21 +199,32 @@ class ARD(object):
             Hatom = gen3D.readstring('smi', '[H]')
             ff = pybel.ob.OBForceField.FindForceField(self.forcefield)
 
+            reac_mol_copy = reac_mol.copy()
             for rxn, mol in enumerate(prod_mols_filtered):
+                print ('Reaction Number', rxn)
                 mol.gen3D(forcefield=self.forcefield, d=self.distance, make3D=False)
+                arrange3D = gen3D.Arrange3D(reac_mol,mol)
+                self.reactant = reac_mol.toNode()
+
                 ff.Setup(Hatom.OBMol)  # Ensures that new coordinates are generated for next molecule (see above)
 
                 rxn_num = '{:04d}'.format(rxn)
                 rxn_name = 'rxn' + rxn_num
                 output_dir = util.makeOutputSubdirectory(rxn_dir, rxn_num)
                 kwargs['output_dir'] = output_dir
-                kwargs['logname'] = rxn_name
+                kwargs['logname'] = 'rxn' + rxn_num
 
-                self.preopt(mol, **kwargs)
-
+#ypli                self.preopt(mol, **kwargs)
                 product = mol.toNode()
+
                 self.logger.info('Reaction {}:\n{}\n{}\n'.format(rxn, mol.write('can').strip(), product))
                 self.makeInputFile(product, **kwargs)
+                job_script = makeBatchSubmissionScript(rxn_name, example_script_path, output_dir)
+
+                reac_mol.setCoordsFromMol(reac_mol_copy)
+
+            job_cmd = kwargs.get('job_cmd', 'qsub')
+            makeOverallSubmissionScript(job_cmd, job_script, self.output_dir)
         else:
             self.logger.info('No feasible products found')
 
@@ -225,19 +238,19 @@ class ARD(object):
         self.logger.info('\nARD terminated on ' + time.asctime())
         self.logger.info('Total ARD run time: {:.1f} s'.format(time.time() - start_time))
 
-    def filterThreshold(self, H298_reac, preopt_energy_reac, prod_mol, thermo_db=None, **kwargs):
+    def filterThreshold(self, H298_reac, PM6_energy_reac, prod_mol, thermo_db=None, **kwargs):
         """
         Filter threshold based on standard enthalpies of formation of reactants
         and products. Returns `True` if the heat of reaction is less than
         `self.dh_cutoff`, `False` otherwise. If the product is a carbene or
-        nitrene, a quick pre-optimization is performed and the resulting
+        nitrene, a quick PM6 optimization is performed and the resulting
         energies are used for filtering the reaction.
         """
-        if preopt_energy_reac is not None and prod_mol.isCarbeneOrNitrene():
-            preopt_energy_prod = self.preopt(prod_mol, **kwargs)
+        if PM6_energy_reac is not None and prod_mol.isCarbeneOrNitrene():
+            PM6_energy_prod = self.preopt(prod_mol, **kwargs)
 
-            if preopt_energy_prod is not None:
-                dH = preopt_energy_prod - preopt_energy_reac
+            if PM6_energy_prod is not None:
+                dH = PM6_energy_prod - PM6_energy_reac
             else:
                 H298_prod = prod_mol.getH298(thermo_db)
                 dH = H298_prod - H298_reac
@@ -257,7 +270,7 @@ class ARD(object):
 
         with open(path, 'w') as f:
             for key, val in kwargs.iteritems():
-                if key not in ('reac_smi', 'nbreak', 'nform', 'dh_cutoff', 'forcefield', 'distance', 'theory_low',
+                if key not in ('job_cmd', 'reac_smi', 'nbreak', 'nform', 'dh_cutoff', 'forcefield', 'distance',
                                'output_dir'):
                     f.write('{0}  {1}\n'.format(key, val))
             f.write('\n')
@@ -279,6 +292,65 @@ class ARD(object):
         self.logger.info('Heat of reaction cutoff: {:.1f} kcal/mol'.format(self.dh_cutoff))
         self.logger.info('Force field for 3D structure generation: ' + self.forcefield)
         self.logger.info('######################################################################\n')
+
+###############################################################################
+
+def makeBatchSubmissionScript(name, example_script, outdir):
+    """
+    Create a batch submission script for a TS search job given a path to the
+    example script and a path to the target directory. Everywhere the string
+    "NAME" appears in the model script, it will be replaced by `name`. Return
+    the path to the submission script.
+    """
+    outpath = os.path.join(outdir, 'submit.sh')
+
+    with open(example_script, 'r') as infile, open(outpath, 'wb') as outfile:
+        for line in infile:
+            line = line.replace('NAME', name)
+            outfile.write(line)
+
+    return outpath
+
+def makeOverallSubmissionScript(cmd, job_script, outdir=''):
+    """
+    Create a bash shell script that when run will submit all TS search jobs to
+    the job scheduler. The name of all job scripts has be given in `job_script`
+    (or the path) and the command for submitting a job has to be specified in
+    `cmd`.
+
+    Note: The script can be run as often as desired. It will only submit jobs
+    that have not yet been submitted, which is useful if there is a limit to
+    the number of jobs that can be submitted. Once all jobs in the queue have
+    executed, the "submitted_jobs" file can be deleted and the script can be
+    re-run to submit jobs that may have failed for an abnormal reason before
+    creating a log file.
+    """
+    script = os.path.join(outdir, 'submitTSjobs.sh')
+
+    with open(script, 'wb') as f:
+        f.write('#!/bin/bash\n\n')
+        f.write('for d in reactions/[0-9]*/\n')
+        f.write('do\n')
+        f.write('   cd $d\n')
+        f.write("   j=`echo $d | sed 's/[^0-9]*//g'`\n\n")
+        f.write('   if [ -s rxn*.log ]\n')
+        f.write('   then\n')
+        f.write('      cd ../..\n')
+        f.write('      continue\n')
+        f.write('   fi\n\n')
+        f.write('   grep -Fxqs "$j" ../../submitted_jobs\n')
+        f.write('   if [ $? -ne 0 ]\n')
+        f.write('   then\n')
+        f.write('      {} {}\n'.format(cmd, os.path.basename(job_script)))
+        f.write('      if [ $? -eq 0 ]\n')
+        f.write('      then\n')
+        f.write('         echo $j >> ../../submitted_jobs\n')
+        f.write('      fi\n')
+        f.write('   fi\n\n')
+        f.write('   cd ../..\n')
+        f.write('done\n')
+
+    os.chmod(script, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IROTH)
 
 ###############################################################################
 
@@ -307,9 +379,9 @@ def readInput(input_file):
     A dictionary containing all input parameters and their values is returned.
     """
     # Allowed keywords
-    keys = ('reac_smi', 'nbreak', 'nform', 'dh_cutoff', 'forcefield', 'distance', 'logname',
-            'nsteps', 'nnode', 'lsf', 'tol', 'gtol', 'nlstnodes',
-            'qprog', 'theory', 'theory_low', 'nproc', 'mem')
+    keys = ('job_cmd', 'reac_smi', 'nbreak', 'nform', 'dh_cutoff', 'forcefield', 'distance', 'logname',
+            'method', 'nsteps', 'nnode', 'lsf', 'tol', 'gtol', 'nlstnodes',
+            'qprog', 'theory', 'theory_preopt', 'nproc', 'mem')
 
     # Read all data from file
     with open(input_file, 'r') as f:
